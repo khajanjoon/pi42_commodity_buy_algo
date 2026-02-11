@@ -2,3 +2,5 @@ asyncio
 aiohttp
 requests
 python-dotenv
+python-socketio
+websocket-client
