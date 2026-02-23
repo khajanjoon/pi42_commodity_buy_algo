@@ -10,21 +10,20 @@ import math
 from dotenv import load_dotenv
 from pathlib import Path
 
-# ========= LOAD ENV SAFELY =========
+# ========= LOAD ENV =========
 load_dotenv(Path(__file__).parent / ".env")
 
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("SECRET_KEY")
 
 if not API_KEY or not API_SECRET:
-    print("❌ API keys not loaded. Check .env file")
+    print("❌ API keys not loaded")
     exit()
 
 # ========= CONFIG =========
 BASE_URL = "https://fapi.pi42.com"
 WS_URL = "https://fawss.pi42.com/"
 
-# INR PAIRS
 SYMBOLS = ["XPTINR", "XPDINR"]
 
 CAPITAL_PER_TRADE = 10000
@@ -49,9 +48,6 @@ last_trade = {s: 0 for s in SYMBOLS}
 # ========= SIGNATURE =========
 def generate_signature(secret, message):
 
-    if not secret or not message:
-        return None
-
     return hmac.new(
         secret.encode(),
         message.encode(),
@@ -60,9 +56,6 @@ def generate_signature(secret, message):
 
 
 def sign(query):
-
-    if not API_SECRET or not query:
-        return None
 
     return hmac.new(
         API_SECRET.encode(),
@@ -73,9 +66,8 @@ def sign(query):
 # ========= PRICE NORMALIZER =========
 def normalize_price(sym, price):
 
-    # INR pairs require integer precision
     if sym.endswith("INR"):
-        return int(round(price, 0))
+        return int(round(price))
 
     return round(price, 2)
 
@@ -86,7 +78,7 @@ def calculate_target(sym, entry):
 
     return normalize_price(sym, tp)
 
-# ========= QTY CALC =========
+# ========= QTY =========
 def calculate_order_qty(sym):
 
     price = prices.get(sym)
@@ -100,49 +92,46 @@ def calculate_order_qty(sym):
 
     qty = math.floor(raw / step) * step
 
-    return round(qty, 6) if qty >= step else None
+    return round(qty, 6)
 
-# ========= ORDER DATA =========
-def get_lowest_buy(sym):
+# ========= TRIGGER BASED ON TP SELL =========
+def get_lowest_tp_sell(sym):
 
     if sym not in orders:
         return None
 
-    buys = [
+    sells = [
         float(o["price"])
-        for o in orders.get(sym, [])
-        if o.get("side") == "BUY" and o.get("price")
+        for o in orders[sym]
+        if o.get("side") == "SELL" and o.get("price")
     ]
 
-    return min(buys) if buys else None
+    if sells:
+        return min(sells)
+
+    return None
 
 
 def get_trigger_price(sym):
 
-    lowest = get_lowest_buy(sym)
+    tp_sell = get_lowest_tp_sell(sym)
 
-    if not lowest:
+    if tp_sell is None:
         return None
 
-    trigger = lowest * (1 - RISE_PERCENT / 100)
+    trigger = tp_sell * (1 - RISE_PERCENT / 100)
 
     return normalize_price(sym, trigger)
 
-# ========= PLACE BUY ORDER =========
+# ========= PLACE BUY =========
 def place_market_buy(sym):
 
     if sym not in prices:
-
-        print("❌ No price available")
-
         return False
 
     qty = calculate_order_qty(sym)
 
     if not qty:
-
-        print("❌ Invalid qty")
-
         return False
 
     entry = normalize_price(sym, prices[sym])
@@ -169,14 +158,7 @@ def place_market_buy(sym):
 
     signature = generate_signature(API_SECRET, body)
 
-    if not signature:
-
-        print("❌ Signature failed")
-
-        return False
-
     headers = {
-
         "api-key": API_KEY,
         "signature": signature,
         "Content-Type": "application/json"
@@ -187,28 +169,27 @@ def place_market_buy(sym):
         r = requests.post(
             f"{BASE_URL}/v1/order/place-order",
             data=body,
-            headers=headers,
-            timeout=15
+            headers=headers
         )
 
         print(f"\n🟢 BUY {sym}")
         print(f"Qty: {qty}")
         print(f"Entry: {entry}")
-        print(f"TP: {tp}")
+        print(f"TP SELL: {tp}")
         print("Response:", r.text)
 
         return True
 
     except Exception as e:
 
-        print("❌ Order failed:", e)
+        print("❌ Order error:", e)
 
         return False
 
 # ========= TRADE LOGIC =========
 def trade_logic(sym):
 
-    if sym not in prices or prices[sym] is None:
+    if sym not in prices:
         return
 
     if time.time() - last_trade[sym] < TRADE_COOLDOWN:
@@ -216,29 +197,25 @@ def trade_logic(sym):
 
     pos = positions.get(sym)
 
-    # FIRST BUY
     if not pos:
 
-        print(f"⚡ No position → Opening FIRST LONG {sym}")
+        print(f"⚡ FIRST BUY {sym}")
 
         if place_market_buy(sym):
-
             last_trade[sym] = time.time()
 
         return
 
-    # ADD BUY
     trigger = get_trigger_price(sym)
 
-    if not trigger:
+    if trigger is None:
         return
 
     if prices[sym] <= trigger:
 
-        print(f"📉 Drop trigger hit {sym} → {prices[sym]}")
+        print(f"📉 Trigger BUY {sym} at {prices[sym]}")
 
         if place_market_buy(sym):
-
             last_trade[sym] = time.time()
 
 # ========= FETCH POSITIONS =========
@@ -254,42 +231,66 @@ def fetch_positions_loop():
 
                 query = f"symbol={sym}&timestamp={ts}"
 
-                signature = sign(query)
-
-                if not signature:
-                    continue
-
                 headers = {
                     "api-key": API_KEY,
-                    "signature": signature
+                    "signature": sign(query)
                 }
 
                 r = requests.get(
                     f"{BASE_URL}/v1/positions/OPEN?{query}",
-                    headers=headers,
-                    timeout=15
+                    headers=headers
                 )
 
-                if r.status_code != 200:
+                if r.status_code == 200:
 
-                    positions[sym] = None
-                    continue
+                    data = r.json()
 
-                data = r.json()
-
-                if not data:
-
-                    positions[sym] = None
-                    continue
-
-                positions[sym] = next(
-                    (p for p in data if p.get("contractPair") == sym),
-                    None
-                )
+                    positions[sym] = next(
+                        (p for p in data if p["contractPair"] == sym),
+                        None
+                    )
 
         except Exception as e:
 
-            print("❌ Position fetch error:", e)
+            print("Position error:", e)
+
+        time.sleep(10)
+
+# ========= FETCH OPEN ORDERS =========
+def fetch_orders_loop():
+
+    while True:
+
+        try:
+
+            ts = str(int(time.time() * 1000))
+
+            query = f"timestamp={ts}"
+
+            headers = {
+                "api-key": API_KEY,
+                "signature": sign(query)
+            }
+
+            r = requests.get(
+                f"{BASE_URL}/v1/order/open-orders?{query}",
+                headers=headers
+            )
+
+            if r.status_code == 200:
+
+                data = r.json()
+
+                for sym in SYMBOLS:
+
+                    orders[sym] = [
+                        o for o in data
+                        if o["symbol"] == sym
+                    ]
+
+        except Exception as e:
+
+            print("Orders error:", e)
 
         time.sleep(10)
 
@@ -298,39 +299,35 @@ def display_loop():
 
     while True:
 
-        print("\n========== LONG DASHBOARD ==========")
+        print("\n========== GRID DASHBOARD ==========")
 
         for sym in SYMBOLS:
 
             price = prices.get(sym)
 
-            pos = positions.get(sym)
-
             trigger = get_trigger_price(sym)
 
             qty = calculate_order_qty(sym)
 
-            print(f"\n🔹 {sym}")
+            print(f"\n{sym}")
             print(f"LTP: {price}")
-            print(f"Trigger: {trigger}")
+            print(f"Next BUY Trigger: {trigger}")
             print(f"Next Qty: {qty}")
+
+            pos = positions.get(sym)
 
             if pos:
 
-                entry = float(pos.get("entryPrice", 0))
-                q = float(pos.get("quantity", 0))
+                entry = float(pos["entryPrice"])
+                q = float(pos["quantity"])
 
                 pnl = (price - entry) * q if price else 0
 
-                print(f"LONG → Qty:{q}")
-                print(f"Entry:{entry}")
-                print(f"PnL:{round(pnl,2)}")
+                print(f"Entry: {entry}")
+                print(f"Qty: {q}")
+                print(f"PnL: {round(pnl,2)}")
 
-            else:
-
-                print("Position → None")
-
-        time.sleep(4)
+        time.sleep(5)
 
 # ========= WEBSOCKET =========
 @sio.event
@@ -351,29 +348,23 @@ def on_price(data):
 
     price = data.get("p")
 
-    if not sym or not price:
-        return
+    if sym and price:
 
-    prices[sym] = float(price)
+        prices[sym] = float(price)
 
-    trade_logic(sym)
+        trade_logic(sym)
 
 # ========= MAIN =========
 if __name__ == "__main__":
 
     threading.Thread(target=fetch_positions_loop, daemon=True).start()
+    threading.Thread(target=fetch_orders_loop, daemon=True).start()
     threading.Thread(target=display_loop, daemon=True).start()
 
     while True:
 
         try:
-
             sio.connect(WS_URL)
-
             sio.wait()
-
-        except Exception as e:
-
-            print("⚠ WS reconnecting:", e)
-
+        except:
             time.sleep(5)
